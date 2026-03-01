@@ -780,7 +780,11 @@ class TestEndToEnd:
             assert scores["layer_types"][i] == expected
 
     def test_full_pipeline_shapes(self, synthetic_model: Path, tmp_path: Path) -> None:
-        """Complete pipeline: score → plan → prune → verify output shapes."""
+        """Complete pipeline: score → plan → prune → verify output shapes.
+
+        Note: Layer removal is auto-disabled for models with
+        full_attention_interval > 1 (GGUF compatibility).
+        """
         from safetensors import safe_open
         from structural_prune import prune_pass, score_pass
 
@@ -790,7 +794,8 @@ class TestEndToEnd:
         # Pass 1: Score
         scores = score_pass(synthetic_model, config)
 
-        # Plan: keep 50% MLP, 2/4 Q heads, 4/8 V heads, remove 2 layers
+        # Plan: keep 50% MLP, 2/4 Q heads, 4/8 V heads
+        # layers_to_remove=2 will be auto-disabled due to full_attention_interval=4
         plan = generate_pruning_plan(
             scores,
             config,
@@ -800,19 +805,18 @@ class TestEndToEnd:
             layers_to_remove=2,
         )
 
-        # Verify plan sanity
+        # Verify plan sanity — layer removal disabled for interval architectures
         assert plan["mlp_new_intermediate_size"] > 0
         assert plan["full_attn_new_num_heads"] == 2
         assert plan["linear_v_new_num_heads"] == 4
-        assert plan["num_layers_after"] == self.NUM_LAYERS - 2
-        assert len(plan["remove_layers"]) == 2
+        assert plan["num_layers_after"] == self.NUM_LAYERS  # no removal
+        assert len(plan["remove_layers"]) == 0
 
         # Pass 2: Prune
         stats = prune_pass(
             synthetic_model, output_dir, plan, config, scores["layer_types"],
         )
         assert stats["pruned_tensors"] > 0
-        assert stats["removed_tensors"] > 0
 
         # Update config
         new_config = update_config(config, plan, output_dir)
@@ -821,27 +825,26 @@ class TestEndToEnd:
         out_shards = list(output_dir.glob("*.safetensors"))
         assert len(out_shards) == 1
 
-        # Verify output config
-        assert new_config["num_hidden_layers"] == self.NUM_LAYERS - 2
+        # Verify output config — all layers preserved
+        assert new_config["num_hidden_layers"] == self.NUM_LAYERS
         assert new_config["intermediate_size"] == plan["mlp_new_intermediate_size"]
         assert new_config["num_attention_heads"] == 2
         assert new_config["linear_num_value_heads"] == 4
 
         # Verify tensor shapes in output
         new_intermediate = plan["mlp_new_intermediate_size"]
-        new_num_layers = plan["num_layers_after"]
 
         with safe_open(str(out_shards[0]), framework="pt", device="cpu") as f:
             names = list(f.keys())
 
-            # Should have correct layer count (0-indexed)
+            # Should have all layers preserved
             layer_indices = set()
             for n in names:
                 idx = parse_layer_idx(n)
                 if idx is not None:
                     layer_indices.add(idx)
-            assert max(layer_indices) == new_num_layers - 1
-            assert len(layer_indices) == new_num_layers
+            assert max(layer_indices) == self.NUM_LAYERS - 1
+            assert len(layer_indices) == self.NUM_LAYERS
 
             # Check a MLP tensor shape
             gate = f.get_tensor("model.layers.0.mlp.gate_proj.weight")
@@ -869,3 +872,325 @@ class TestEndToEnd:
         # No output dir created
         output_dir = tmp_path / "should_not_exist"
         assert not output_dir.exists()
+
+
+# ---------------------------------------------------------------------------
+# DeltaNet tensor pruning (Phase C extension)
+# ---------------------------------------------------------------------------
+
+
+class TestDeltaNetTensorPruning:
+    """Tests for DeltaNet-specific tensor pruning (in_proj_z, in_proj_a/b, A_log, dt_bias, conv1d)."""
+
+    DELTANET_CONFIG = {
+        "linear_num_value_heads": 48,
+        "linear_value_head_dim": 128,
+        "linear_num_key_heads": 16,
+        "linear_key_head_dim": 128,
+    }
+
+    def _make_plan(self, keep_v: list[int]) -> dict:
+        return {"linear_v_keep_heads": keep_v}
+
+    def test_in_proj_z_shape(self) -> None:
+        """in_proj_z: [n_v * v_dim, hidden] → prune V head rows."""
+        n_v, v_dim, hidden = 48, 128, 5120
+        z = torch.randn(n_v * v_dim, hidden)
+
+        keep_v = list(range(32))  # keep 32 of 48
+        result = prune_tensor(
+            "model.layers.0.self_attn.in_proj_z.weight",
+            z,
+            self._make_plan(keep_v),
+            layer_idx=0,
+            layer_type="linear_attention",
+            config=self.DELTANET_CONFIG,
+        )
+        assert result is not None
+        _, pruned = result
+        assert pruned.shape == (32 * v_dim, hidden)
+
+    def test_in_proj_a_shape(self) -> None:
+        """in_proj_a: [n_v, hidden] → one row per V head."""
+        n_v, hidden = 48, 5120
+        a = torch.randn(n_v, hidden)
+
+        keep_v = list(range(32))
+        result = prune_tensor(
+            "model.layers.0.self_attn.in_proj_a.weight",
+            a,
+            self._make_plan(keep_v),
+            layer_idx=0,
+            layer_type="linear_attention",
+            config=self.DELTANET_CONFIG,
+        )
+        assert result is not None
+        _, pruned = result
+        assert pruned.shape == (32, hidden)
+
+    def test_in_proj_b_shape(self) -> None:
+        """in_proj_b: [n_v, hidden] → one row per V head."""
+        n_v, hidden = 48, 5120
+        b = torch.randn(n_v, hidden)
+
+        keep_v = list(range(32))
+        result = prune_tensor(
+            "model.layers.0.self_attn.in_proj_b.weight",
+            b,
+            self._make_plan(keep_v),
+            layer_idx=0,
+            layer_type="linear_attention",
+            config=self.DELTANET_CONFIG,
+        )
+        assert result is not None
+        _, pruned = result
+        assert pruned.shape == (32, hidden)
+
+    def test_A_log_shape(self) -> None:
+        """A_log: [n_v] → one element per V head."""
+        A_log = torch.randn(48)
+
+        keep_v = list(range(32))
+        result = prune_tensor(
+            "model.layers.0.self_attn.A_log",
+            A_log,
+            self._make_plan(keep_v),
+            layer_idx=0,
+            layer_type="linear_attention",
+            config=self.DELTANET_CONFIG,
+        )
+        assert result is not None
+        _, pruned = result
+        assert pruned.shape == (32,)
+
+    def test_dt_bias_shape(self) -> None:
+        """dt_bias: [n_v] → one element per V head."""
+        dt = torch.randn(48)
+
+        keep_v = list(range(32))
+        result = prune_tensor(
+            "model.layers.0.self_attn.dt_bias",
+            dt,
+            self._make_plan(keep_v),
+            layer_idx=0,
+            layer_type="linear_attention",
+            config=self.DELTANET_CONFIG,
+        )
+        assert result is not None
+        _, pruned = result
+        assert pruned.shape == (32,)
+
+    def test_conv1d_shape(self) -> None:
+        """conv1d: fused [Q+K+V, 1, kernel] → prune V segment."""
+        n_qk, qk_dim = 16, 128
+        n_v, v_dim = 48, 128
+        kernel = 4
+        fused_dim = n_qk * qk_dim * 2 + n_v * v_dim  # 2048+2048+6144=10240
+        conv = torch.randn(fused_dim, 1, kernel)
+
+        keep_v = list(range(32))
+        result = prune_tensor(
+            "model.layers.0.self_attn.conv1d.weight",
+            conv,
+            self._make_plan(keep_v),
+            layer_idx=0,
+            layer_type="linear_attention",
+            config=self.DELTANET_CONFIG,
+        )
+        assert result is not None
+        _, pruned = result
+        # Q+K unchanged (4096) + V pruned (32*128=4096) = 8192
+        expected = n_qk * qk_dim * 2 + 32 * v_dim
+        assert pruned.shape == (expected, 1, kernel)
+
+    def test_conv1d_qk_rows_preserved(self) -> None:
+        """conv1d: Q+K rows (first 4096) should be unchanged."""
+        n_qk, qk_dim = 16, 128
+        n_v, v_dim = 48, 128
+        kernel = 4
+        fused_dim = n_qk * qk_dim * 2 + n_v * v_dim
+        conv = torch.arange(fused_dim * kernel, dtype=torch.float32).view(fused_dim, 1, kernel)
+
+        keep_v = list(range(32))
+        _, pruned = prune_tensor(
+            "model.layers.0.self_attn.conv1d.weight",
+            conv,
+            self._make_plan(keep_v),
+            layer_idx=0,
+            layer_type="linear_attention",
+            config=self.DELTANET_CONFIG,
+        )
+        qk_size = n_qk * qk_dim * 2
+        assert torch.equal(pruned[:qk_size], conv[:qk_size])
+
+    def test_in_proj_a_values_preserved(self) -> None:
+        """Kept V head rows should contain original data."""
+        n_v, hidden = 48, 8
+        a = torch.arange(n_v * hidden, dtype=torch.float32).view(n_v, hidden)
+
+        keep_v = [0, 5, 10, 47]
+        _, pruned = prune_tensor(
+            "model.layers.0.self_attn.in_proj_a.weight",
+            a,
+            self._make_plan(keep_v),
+            layer_idx=0,
+            layer_type="linear_attention",
+            config=self.DELTANET_CONFIG,
+        )
+        assert torch.equal(pruned[0], a[0])
+        assert torch.equal(pruned[1], a[5])
+        assert torch.equal(pruned[2], a[10])
+        assert torch.equal(pruned[3], a[47])
+
+    def test_full_attention_layer_skips_deltanet(self) -> None:
+        """DeltaNet tensors in full-attention layers should not be pruned."""
+        z = torch.randn(48 * 128, 5120)
+
+        keep_v = list(range(32))
+        result = prune_tensor(
+            "model.layers.3.self_attn.in_proj_z.weight",
+            z,
+            self._make_plan(keep_v),
+            layer_idx=3,
+            layer_type="full_attention",
+            config=self.DELTANET_CONFIG,
+        )
+        assert result is not None
+        _, pruned = result
+        assert pruned.shape == z.shape  # unchanged
+
+
+# ---------------------------------------------------------------------------
+# V-head divisibility enforcement
+# ---------------------------------------------------------------------------
+
+
+class TestVHeadDivisibility:
+    """Tests for V-head count rounding to K-head divisibility."""
+
+    def test_34_rounded_to_32_for_k16(self) -> None:
+        """34 V heads with K=16 should be rounded down to 32."""
+        scores = {
+            "mlp_channel_scores": None,
+            "full_head_scores": None,
+            "linear_v_scores": torch.randn(48).abs(),
+            "linear_v_count": 1,
+            "layer_scores": {i: float(i) for i in range(8)},
+            "layer_types": {i: "linear_attention" for i in range(8)},
+        }
+        config = {"num_hidden_layers": 8, "linear_num_key_heads": 16}
+
+        plan = generate_pruning_plan(
+            scores, config,
+            mlp_keep_ratio=1.0,
+            full_head_keep=24,
+            linear_v_keep=34,
+            layers_to_remove=0,
+        )
+        assert plan["linear_v_new_num_heads"] == 32
+        assert len(plan["linear_v_keep_heads"]) == 32
+
+    def test_32_stays_32_for_k16(self) -> None:
+        """32 V heads with K=16 needs no rounding."""
+        scores = {
+            "mlp_channel_scores": None,
+            "full_head_scores": None,
+            "linear_v_scores": torch.randn(48).abs(),
+            "linear_v_count": 1,
+            "layer_scores": {i: float(i) for i in range(8)},
+            "layer_types": {i: "linear_attention" for i in range(8)},
+        }
+        config = {"num_hidden_layers": 8, "linear_num_key_heads": 16}
+
+        plan = generate_pruning_plan(
+            scores, config,
+            mlp_keep_ratio=1.0,
+            full_head_keep=24,
+            linear_v_keep=32,
+            layers_to_remove=0,
+        )
+        assert plan["linear_v_new_num_heads"] == 32
+
+
+# ---------------------------------------------------------------------------
+# Layer removal disabled for interval architectures
+# ---------------------------------------------------------------------------
+
+
+class TestLayerRemovalIntervalGuard:
+    """Tests for automatic layer removal disabling with full_attention_interval."""
+
+    def test_interval_4_disables_layer_removal(self) -> None:
+        """Models with full_attention_interval=4 should skip layer removal."""
+        scores = {
+            "mlp_channel_scores": None,
+            "full_head_scores": None,
+            "linear_v_scores": None,
+            "layer_scores": {i: 0.01 for i in range(16)},
+            "layer_types": {
+                i: "full_attention" if (i + 1) % 4 == 0 else "linear_attention"
+                for i in range(16)
+            },
+        }
+        config = {"num_hidden_layers": 16, "full_attention_interval": 4}
+
+        plan = generate_pruning_plan(
+            scores, config,
+            mlp_keep_ratio=1.0,
+            full_head_keep=24,
+            linear_v_keep=48,
+            layers_to_remove=4,
+        )
+        assert plan["remove_layers"] == []
+        assert plan["num_layers_after"] == 16
+
+    def test_interval_1_allows_layer_removal(self) -> None:
+        """Standard transformers (interval=1) should allow layer removal."""
+        scores = {
+            "mlp_channel_scores": None,
+            "full_head_scores": None,
+            "linear_v_scores": None,
+            "layer_scores": {i: float(i) for i in range(16)},
+            "layer_types": {i: "linear_attention" for i in range(16)},
+        }
+        config = {"num_hidden_layers": 16, "full_attention_interval": 1}
+
+        plan = generate_pruning_plan(
+            scores, config,
+            mlp_keep_ratio=1.0,
+            full_head_keep=24,
+            linear_v_keep=48,
+            layers_to_remove=4,
+        )
+        assert len(plan["remove_layers"]) == 4
+        assert plan["num_layers_after"] == 12
+
+
+# ---------------------------------------------------------------------------
+# Safetensors index regeneration
+# ---------------------------------------------------------------------------
+
+
+class TestSafetensorsIndexRegeneration:
+    """Tests for safetensors.index.json regeneration."""
+
+    def test_regenerated_index_matches_shards(self, tmp_path: Path) -> None:
+        """Generated index should list all tensors from all shards."""
+        from safetensors.torch import save_file
+        from structural_prune import regenerate_safetensors_index
+
+        # Create two shard files
+        t1 = {"model.layers.0.weight": torch.randn(4, 4)}
+        t2 = {"model.layers.1.weight": torch.randn(4, 4)}
+        save_file(t1, str(tmp_path / "model.safetensors-00001-of-00002.safetensors"))
+        save_file(t2, str(tmp_path / "model.safetensors-00002-of-00002.safetensors"))
+
+        regenerate_safetensors_index(tmp_path)
+
+        index = json.loads((tmp_path / "model.safetensors.index.json").read_text())
+        wm = index["weight_map"]
+        assert "model.layers.0.weight" in wm
+        assert "model.layers.1.weight" in wm
+        assert wm["model.layers.0.weight"] == "model.safetensors-00001-of-00002.safetensors"
+        assert wm["model.layers.1.weight"] == "model.safetensors-00002-of-00002.safetensors"
+        assert index["metadata"]["total_size"] > 0

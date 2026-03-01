@@ -302,12 +302,27 @@ def generate_pruning_plan(
     if scores["linear_v_scores"] is not None:
         s = scores["linear_v_scores"]
         n_keep = min(linear_v_keep, s.shape[0])
+        # Enforce divisibility by linear_num_key_heads for GGUF compatibility
+        n_k = config.get("linear_num_key_heads", 1)
+        if n_k > 1 and n_keep % n_k != 0:
+            n_keep = (n_keep // n_k) * n_k
+            print(f"  Note: V heads rounded to {n_keep} for K-head divisibility ({n_k})")
         _, keep_idx = torch.topk(s, n_keep)
         plan["linear_v_keep_heads"] = sorted(keep_idx.tolist())
         plan["linear_v_new_num_heads"] = n_keep
         print(f"  Linear V heads: {s.shape[0]} → {n_keep}")
 
     # Phase D — Layer removal (linear-attention only, protect edges)
+    # Skip if architecture uses full_attention_interval (GGUF format only
+    # supports a single interval integer, not per-layer arrays)
+    full_attn_interval = config.get("full_attention_interval", 1)
+    if full_attn_interval > 1 and layers_to_remove > 0:
+        print(
+            f"  Note: Layer removal disabled — full_attention_interval="
+            f"{full_attn_interval} requires fixed pattern for GGUF"
+        )
+        layers_to_remove = 0
+
     layer_scores = scores["layer_scores"]
     layer_types = scores["layer_types"]
 
@@ -438,6 +453,35 @@ def prune_tensor(
             cols = [i for h in keep_v for i in range(h * head_dim, (h + 1) * head_dim)]
             return (new_name, tensor[:, cols])
 
+        # --- DeltaNet-specific tensors (V-head dependent) ---
+
+        # in_proj_z: [n_v * v_dim, hidden_size] — same layout as v_proj
+        if "in_proj_z" in name:
+            rows = [i for h in keep_v for i in range(h * v_dim, (h + 1) * v_dim)]
+            return (new_name, tensor[rows])
+
+        # in_proj_a / in_proj_b: [n_v, hidden_size] — one row per V head
+        if "in_proj_a" in name or "in_proj_b" in name:
+            return (new_name, tensor[keep_v])
+
+        # A_log / dt_bias: [n_v] — one element per V head
+        if name.endswith("A_log") or name.endswith("dt_bias"):
+            return (new_name, tensor[keep_v])
+
+        # conv1d: fused [Q_size + K_size + V_size, 1, kernel] — prune V segment
+        if "conv1d" in name:
+            n_qk = config.get("linear_num_key_heads", 16)
+            qk_dim = config.get("linear_key_head_dim", 128)
+            q_size = n_qk * qk_dim
+            k_size = n_qk * qk_dim
+            qk_rows = list(range(q_size + k_size))
+            v_rows = [
+                q_size + k_size + i
+                for h in keep_v
+                for i in range(h * v_dim, (h + 1) * v_dim)
+            ]
+            return (new_name, tensor[qk_rows + v_rows])
+
     return (new_name, tensor)
 
 
@@ -452,9 +496,15 @@ def prune_pass(
     config: dict,
     layer_types: dict[int, str],
 ) -> dict:
-    """Read each shard, prune tensors, write to *output_dir*."""
+    """Read each shard, prune tensors, write to *output_dir*.
+
+    When ``output_dir == model_dir`` (in-place mode), each shard is written
+    to a ``.tmp`` file and then atomically renamed over the original to
+    minimise disk overhead.
+    """
     shards = sorted(model_dir.glob("*.safetensors"))
     stats = {"total_tensors": 0, "pruned_tensors": 0, "removed_tensors": 0}
+    in_place = output_dir == model_dir
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -496,8 +546,15 @@ def prune_pass(
 
         if out_tensors:
             out_path = output_dir / shard.name
-            save_file(out_tensors, str(out_path))
-            print(f"    Wrote {out_path.name} ({len(out_tensors)} tensors)", flush=True)
+            if in_place:
+                tmp_path = shard.with_suffix(".tmp")
+                save_file(out_tensors, str(tmp_path))
+                shard.unlink()
+                tmp_path.rename(out_path)
+                print(f"    Replaced {out_path.name} ({len(out_tensors)} tensors)", flush=True)
+            else:
+                save_file(out_tensors, str(out_path))
+                print(f"    Wrote {out_path.name} ({len(out_tensors)} tensors)", flush=True)
 
     return stats
 
@@ -548,6 +605,37 @@ def update_config(config: dict, plan: dict, output_dir: Path) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Safetensors index regeneration
+# ---------------------------------------------------------------------------
+
+
+def regenerate_safetensors_index(output_dir: Path) -> None:
+    """Regenerate ``model.safetensors.index.json`` from actual shard contents."""
+    shards = sorted(output_dir.glob("model.safetensors-*.safetensors"))
+    if not shards:
+        return
+
+    weight_map: dict[str, str] = {}
+    total_size = 0
+
+    for shard in shards:
+        with safe_open(str(shard), framework="pt", device="cpu") as f:
+            for name in f.keys():
+                weight_map[name] = shard.name
+                t = f.get_tensor(name)
+                total_size += t.nelement() * t.element_size()
+
+    index = {
+        "metadata": {"total_size": total_size},
+        "weight_map": dict(sorted(weight_map.items())),
+    }
+    index_path = output_dir / "model.safetensors.index.json"
+    with open(index_path, "w") as fp:
+        json.dump(index, fp, indent=2)
+    print(f"  Index regenerated: {index_path} ({len(weight_map)} tensors)")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -557,6 +645,8 @@ def main() -> int:
     )
     parser.add_argument("--model-dir", required=True, help="Source safetensors directory")
     parser.add_argument("--output-dir", help="Output directory (default: {model-dir}-pruned)")
+    parser.add_argument("--in-place", action="store_true",
+                        help="Prune in-place (overwrites source shards to save disk)")
     parser.add_argument("--dry-run", action="store_true", help="Score and plan only")
     parser.add_argument("--mlp-keep-ratio", type=float, default=0.70)
     parser.add_argument("--full-head-keep", type=int, default=16)
@@ -567,11 +657,12 @@ def main() -> int:
     args = parser.parse_args()
 
     model_dir = Path(args.model_dir)
-    output_dir = (
-        Path(args.output_dir)
-        if args.output_dir
-        else model_dir.parent / f"{model_dir.name}-pruned"
-    )
+    if args.in_place:
+        output_dir = model_dir
+    elif args.output_dir:
+        output_dir = Path(args.output_dir)
+    else:
+        output_dir = model_dir.parent / f"{model_dir.name}-pruned"
 
     config_path = model_dir / "config.json"
     if not config_path.exists():
@@ -648,6 +739,10 @@ Dry run:  {args.dry_run}
     # Config
     print(f"\n{'=' * 40}\nConfig Update\n{'=' * 40}", flush=True)
     update_config(config, plan, output_dir)
+
+    # Regenerate safetensors index
+    print(f"\n{'=' * 40}\nRegenerating Safetensors Index\n{'=' * 40}", flush=True)
+    regenerate_safetensors_index(output_dir)
 
     # Copy auxiliary files
     for src in model_dir.iterdir():
