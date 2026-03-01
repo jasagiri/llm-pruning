@@ -35,9 +35,12 @@ DEVICE = (
 PROTECTED_FIRST = 4
 PROTECTED_LAST = 4
 
-# Tensor name patterns
-LAYER_RE = re.compile(r"model\.layers\.(\d+)\.")
+# Tensor name patterns — support both "model.layers.X." and
+# "model.language_model.layers.X." (Qwen3.5 multimodal)
+LAYER_RE = re.compile(r"(?:model\.(?:language_model\.)?layers|mtp\.layers)\.(\d+)\.")
 SKIP_PATTERNS = ["embed_tokens", "lm_head", "norm", "layernorm"]
+# Non-layer tensors to pass through untouched (vision encoder, embeddings, etc.)
+PASSTHROUGH_PREFIXES = ["model.visual.", "mtp."]
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +160,9 @@ def score_pass(model_dir: Path, config: dict) -> dict:
             # Group tensors by layer
             by_layer: dict[int, dict[str, torch.Tensor]] = {}
             for name in f.keys():
+                # Skip passthrough prefixes (vision, mtp)
+                if any(name.startswith(p) for p in PASSTHROUGH_PREFIXES):
+                    continue
                 idx = parse_layer_idx(name)
                 if idx is not None:
                     by_layer.setdefault(idx, {})[name] = f.get_tensor(name)
@@ -199,7 +205,7 @@ def score_pass(model_dir: Path, config: dict) -> dict:
                         group_means.append(scores.mean().item())
                         print(f"    {name}: Full-attn Q heads ({n_heads})", flush=True)
 
-                    # --- Linear-attention V heads ---
+                    # --- Linear-attention V heads (separate v_proj or fused in_proj_qkv) ---
                     elif "v_proj" in name and ltype == "linear_attention":
                         n_v = config.get("linear_num_value_heads", 48)
                         if n_v > 0:
@@ -211,6 +217,28 @@ def score_pass(model_dir: Path, config: dict) -> dict:
                             linear_v_count += 1
                             group_means.append(scores.mean().item())
                             print(f"    {name}: Linear V heads ({n_v})", flush=True)
+
+                    elif "in_proj_qkv" in name and ltype == "linear_attention":
+                        # Fused QKV: extract V segment for scoring
+                        n_qk = config.get("linear_num_key_heads", 16)
+                        n_v = config.get("linear_num_value_heads", 48)
+                        qk_dim = config.get("linear_key_head_dim", 128)
+                        v_dim = config.get("linear_value_head_dim", 128)
+                        q_size = n_qk * qk_dim
+                        k_size = n_qk * qk_dim
+                        v_size = n_v * v_dim
+                        if tensor.shape[0] >= q_size + k_size + v_size and n_v > 0:
+                            v_tensor = tensor[q_size + k_size : q_size + k_size + v_size]
+                            scores = equilibrium_group_scores(v_tensor, group_size=v_dim)
+                            if linear_v_scores is None:
+                                linear_v_scores = torch.zeros(n_v)
+                            linear_v_scores += scores[:n_v]
+                            linear_v_count += 1
+                            group_means.append(scores.mean().item())
+                            print(f"    {name}: Linear V heads from fused QKV ({n_v})", flush=True)
+                        else:
+                            scores = equilibrium_group_scores(tensor, group_size=1)
+                            group_means.append(scores.mean().item())
 
                     else:
                         scores = equilibrium_group_scores(tensor, group_size=1)
@@ -367,19 +395,44 @@ def prune_tensor(
     keep_v = plan.get("linear_v_keep_heads")
     if keep_v is not None and layer_type == "linear_attention":
         n_v = config.get("linear_num_value_heads", 48)
+        v_dim = config.get("linear_value_head_dim", 128)
 
+        # Separate v_proj (standard naming)
         if "v_proj" in name:
-            if is_bias:
-                head_dim = tensor.shape[0] // n_v
-                rows = [i for h in keep_v for i in range(h * head_dim, (h + 1) * head_dim)]
-                return (new_name, tensor[rows])
             head_dim = tensor.shape[0] // n_v
             rows = [i for h in keep_v for i in range(h * head_dim, (h + 1) * head_dim)]
             return (new_name, tensor[rows])
 
+        # Fused QKV (Qwen3.5 DeltaNet): prune V segment
+        if "in_proj_qkv" in name:
+            n_qk = config.get("linear_num_key_heads", 16)
+            qk_dim = config.get("linear_key_head_dim", 128)
+            q_size = n_qk * qk_dim
+            k_size = n_qk * qk_dim
+            v_size = n_v * v_dim
+            if is_bias:
+                q_bias = tensor[:q_size]
+                k_bias = tensor[q_size:q_size + k_size]
+                v_bias = tensor[q_size + k_size:q_size + k_size + v_size]
+                v_rows = [i for h in keep_v for i in range(h * v_dim, (h + 1) * v_dim)]
+                return (new_name, torch.cat([q_bias, k_bias, v_bias[v_rows]]))
+            q_part = tensor[:q_size]
+            k_part = tensor[q_size:q_size + k_size]
+            v_part = tensor[q_size + k_size:q_size + k_size + v_size]
+            v_rows = [i for h in keep_v for i in range(h * v_dim, (h + 1) * v_dim)]
+            return (new_name, torch.cat([q_part, k_part, v_part[v_rows]]))
+
+        # out_proj in linear_attn namespace: prune columns for V heads
+        if "linear_attn" in name and "out_proj" in name:
+            if is_bias:
+                return (new_name, tensor)  # out_proj bias = hidden_size
+            cols = [i for h in keep_v for i in range(h * v_dim, (h + 1) * v_dim)]
+            return (new_name, tensor[:, cols])
+
+        # Standard o_proj in linear attention
         if "o_proj" in name:
             if is_bias:
-                return (new_name, tensor)  # o_proj bias = hidden_size, unchanged
+                return (new_name, tensor)
             head_dim = tensor.shape[1] // n_v
             cols = [i for h in keep_v for i in range(h * head_dim, (h + 1) * head_dim)]
             return (new_name, tensor[:, cols])
@@ -412,6 +465,12 @@ def prune_pass(
             for name in f.keys():
                 tensor = f.get_tensor(name)
                 stats["total_tensors"] += 1
+
+                # Passthrough non-language-model tensors (vision, mtp)
+                if any(name.startswith(p) for p in PASSTHROUGH_PREFIXES):
+                    out_tensors[name] = tensor
+                    continue
+
                 idx = parse_layer_idx(name)
 
                 if idx is None:
@@ -462,6 +521,9 @@ def update_config(config: dict, plan: dict, output_dir: Path) -> dict:
 
     if "linear_v_new_num_heads" in plan:
         new["linear_num_value_heads"] = plan["linear_v_new_num_heads"]
+        # Also update text_config if present (multimodal models)
+        if "text_config" in new:
+            new["text_config"]["linear_num_value_heads"] = plan["linear_v_new_num_heads"]
 
     if "num_layers_after" in plan:
         new["num_hidden_layers"] = plan["num_layers_after"]
@@ -514,6 +576,15 @@ def main() -> int:
 
     with open(config_path) as fp:
         config = json.load(fp)
+
+    # Qwen3.5 multimodal nests text config under text_config
+    if "text_config" in config:
+        text_config = config["text_config"]
+        # Merge text_config into top-level for uniform access
+        for k, v in text_config.items():
+            if k not in config:
+                config[k] = v
+        print("Note: Using text_config from multimodal model config")
 
     banner = f"""{'=' * 60}
 Structural Pruning (Equilibrium, arXiv:2512.22106)
