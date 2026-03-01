@@ -13,6 +13,7 @@ Usage:
 """
 
 import argparse
+import copy
 import json
 import re
 import shutil
@@ -507,33 +508,36 @@ def prune_pass(
 
 def update_config(config: dict, plan: dict, output_dir: Path) -> dict:
     """Write an updated ``config.json`` reflecting the pruned dimensions."""
-    new = config.copy()
+    new = copy.deepcopy(config)
+
+    # Helper: update a field in both top-level and text_config
+    def _set(key: str, val: object) -> None:
+        new[key] = val
+        if "text_config" in new and key in new["text_config"]:
+            new["text_config"][key] = val
 
     if "mlp_new_intermediate_size" in plan:
-        new["intermediate_size"] = plan["mlp_new_intermediate_size"]
+        _set("intermediate_size", plan["mlp_new_intermediate_size"])
 
     if "full_attn_new_num_heads" in plan:
         # Preserve original head_dim so k/v proj dimensions stay consistent
         orig_heads = config.get("num_attention_heads", 1)
         head_dim = config.get("head_dim", config.get("hidden_size", 0) // orig_heads)
-        new["num_attention_heads"] = plan["full_attn_new_num_heads"]
-        new["head_dim"] = head_dim
+        _set("num_attention_heads", plan["full_attn_new_num_heads"])
+        _set("head_dim", head_dim)
 
     if "linear_v_new_num_heads" in plan:
-        new["linear_num_value_heads"] = plan["linear_v_new_num_heads"]
-        # Also update text_config if present (multimodal models)
-        if "text_config" in new:
-            new["text_config"]["linear_num_value_heads"] = plan["linear_v_new_num_heads"]
+        _set("linear_num_value_heads", plan["linear_v_new_num_heads"])
 
     if "num_layers_after" in plan:
-        new["num_hidden_layers"] = plan["num_layers_after"]
+        _set("num_hidden_layers", plan["num_layers_after"])
 
-        # Rebuild layer_type list if present
-        if "layer_type" in config:
-            remove_set = set(plan.get("remove_layers", []))
-            new["layer_type"] = [
-                t for i, t in enumerate(config["layer_type"]) if i not in remove_set
-            ]
+        # Rebuild layer_types list (Qwen3.5 uses "layer_types", others "layer_type")
+        remove_set = set(plan.get("remove_layers", []))
+        for key in ("layer_types", "layer_type"):
+            if key in config:
+                pruned = [t for i, t in enumerate(config[key]) if i not in remove_set]
+                _set(key, pruned)
 
     config_path = output_dir / "config.json"
     with open(config_path, "w") as fp:
