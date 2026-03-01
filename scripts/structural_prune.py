@@ -37,7 +37,7 @@ PROTECTED_LAST = 4
 
 # Tensor name patterns
 LAYER_RE = re.compile(r"model\.layers\.(\d+)\.")
-SKIP_PATTERNS = ["embed_tokens", "lm_head", "norm", "bias", "layernorm"]
+SKIP_PATTERNS = ["embed_tokens", "lm_head", "norm", "layernorm"]
 
 
 # ---------------------------------------------------------------------------
@@ -131,7 +131,9 @@ def score_pass(model_dir: Path, config: dict) -> dict:
     """Read all shards and compute per-group importance scores."""
     shards = sorted(model_dir.glob("*.safetensors"))
     num_layers = config.get("num_hidden_layers", 64)
-    full_attn_interval = config.get("full_attention_interval", 4)
+    # Default to 1 (all layers are full attention) for standard transformers.
+    # Qwen3.5 DeltaNet uses interval=4 (3 linear + 1 full).
+    full_attn_interval = config.get("full_attention_interval", 1)
 
     # Accumulators — will be initialised on first encounter
     mlp_channel_scores: Optional[torch.Tensor] = None
@@ -324,16 +326,22 @@ def prune_tensor(
     new_idx = layer_map.get(layer_idx, layer_idx)
     new_name = rename_layer(name, layer_idx, new_idx)
 
-    # Passthrough for norms / biases / 1-D tensors
-    if any(p in name for p in SKIP_PATTERNS) or tensor.dim() < 2:
+    # Passthrough for norms / non-prunable patterns
+    if any(p in name for p in SKIP_PATTERNS):
         return (new_name, tensor)
+
+    is_bias = tensor.dim() == 1 and name.endswith(".bias")
 
     # Phase A — MLP channels
     keep_ch = plan.get("mlp_keep_channels")
     if keep_ch is not None:
         if "gate_proj" in name or "up_proj" in name:
+            if is_bias:
+                return (new_name, tensor[keep_ch])
             return (new_name, tensor[keep_ch])
         if "down_proj" in name:
+            if is_bias:
+                return (new_name, tensor)  # down_proj bias = hidden_size, unchanged
             return (new_name, tensor[:, keep_ch])
 
     # Phase B — Full-attention Q heads
@@ -347,6 +355,8 @@ def prune_tensor(
             return (new_name, tensor[rows])
 
         if "o_proj" in name:
+            if is_bias:
+                return (new_name, tensor)  # o_proj bias = hidden_size, unchanged
             head_dim = tensor.shape[1] // n_heads
             cols = [i for h in keep_heads for i in range(h * head_dim, (h + 1) * head_dim)]
             return (new_name, tensor[:, cols])
@@ -359,11 +369,17 @@ def prune_tensor(
         n_v = config.get("linear_num_value_heads", 48)
 
         if "v_proj" in name:
+            if is_bias:
+                head_dim = tensor.shape[0] // n_v
+                rows = [i for h in keep_v for i in range(h * head_dim, (h + 1) * head_dim)]
+                return (new_name, tensor[rows])
             head_dim = tensor.shape[0] // n_v
             rows = [i for h in keep_v for i in range(h * head_dim, (h + 1) * head_dim)]
             return (new_name, tensor[rows])
 
         if "o_proj" in name:
+            if is_bias:
+                return (new_name, tensor)  # o_proj bias = hidden_size, unchanged
             head_dim = tensor.shape[1] // n_v
             cols = [i for h in keep_v for i in range(h * head_dim, (h + 1) * head_dim)]
             return (new_name, tensor[:, cols])
@@ -438,7 +454,11 @@ def update_config(config: dict, plan: dict, output_dir: Path) -> dict:
         new["intermediate_size"] = plan["mlp_new_intermediate_size"]
 
     if "full_attn_new_num_heads" in plan:
+        # Preserve original head_dim so k/v proj dimensions stay consistent
+        orig_heads = config.get("num_attention_heads", 1)
+        head_dim = config.get("head_dim", config.get("hidden_size", 0) // orig_heads)
         new["num_attention_heads"] = plan["full_attn_new_num_heads"]
+        new["head_dim"] = head_dim
 
     if "linear_v_new_num_heads" in plan:
         new["linear_num_value_heads"] = plan["linear_v_new_num_heads"]
